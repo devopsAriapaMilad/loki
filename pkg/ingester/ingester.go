@@ -36,7 +36,6 @@ import (
 	"github.com/grafana/loki/pkg/storage/config"
 	"github.com/grafana/loki/pkg/usagestats"
 	"github.com/grafana/loki/pkg/util"
-	errUtil "github.com/grafana/loki/pkg/util"
 	util_log "github.com/grafana/loki/pkg/util/log"
 	"github.com/grafana/loki/pkg/validation"
 )
@@ -200,6 +199,7 @@ type Ingester struct {
 
 	// One queue per flush thread.  Fingerprint is used to
 	// pick a queue.
+
 	flushQueues     []*util.PriorityQueue
 	flushQueuesDone sync.WaitGroup
 
@@ -490,7 +490,7 @@ func (i *Ingester) running(ctx context.Context) error {
 // At this point, loop no longer runs, but flushers are still running.
 func (i *Ingester) stopping(_ error) error {
 	i.stopIncomingRequests()
-	var errs errUtil.MultiError
+	var errs util.MultiError
 	errs.Add(i.wal.Stop())
 
 	if i.flushOnShutdownSwitch.Get() {
@@ -596,13 +596,13 @@ func (i *Ingester) Query(req *logproto.QueryRequest, queryServer logproto.Querie
 		}}
 		storeItr, err := i.store.SelectLogs(ctx, storeReq)
 		if err != nil {
-			errUtil.LogErrorWithContext(ctx, "closing iterator", it.Close)
+			util.LogErrorWithContext(ctx, "closing iterator", it.Close)
 			return err
 		}
 		it = iter.NewMergeEntryIterator(ctx, []iter.EntryIterator{it, storeItr}, req.Direction)
 	}
 
-	defer errUtil.LogErrorWithContext(ctx, "closing iterator", it.Close)
+	defer util.LogErrorWithContext(ctx, "closing iterator", it.Close)
 
 	return sendBatches(ctx, it, queryServer, req.Limit)
 }
@@ -633,14 +633,14 @@ func (i *Ingester) QuerySample(req *logproto.SampleQueryRequest, queryServer log
 		}}
 		storeItr, err := i.store.SelectSamples(ctx, storeReq)
 		if err != nil {
-			errUtil.LogErrorWithContext(ctx, "closing iterator", it.Close)
+			util.LogErrorWithContext(ctx, "closing iterator", it.Close)
 			return err
 		}
 
 		it = iter.NewMergeSampleIterator(ctx, []iter.SampleIterator{it, storeItr})
 	}
 
-	defer errUtil.LogErrorWithContext(ctx, "closing iterator", it.Close)
+	defer util.LogErrorWithContext(ctx, "closing iterator", it.Close)
 
 	return sendSampleBatches(ctx, it, queryServer)
 }
@@ -649,6 +649,9 @@ func (i *Ingester) QuerySample(req *logproto.SampleQueryRequest, queryServer log
 // max look back is limited to from time of boltdb-shipper config.
 // It considers previous periodic config's from time if that also has index type set to boltdb-shipper.
 func (i *Ingester) boltdbShipperMaxLookBack() time.Duration {
+	if len(i.periodicConfigs) == 0 {
+		return -1 << 63
+	}
 	activePeriodicConfigIndex := config.ActivePeriodConfig(i.periodicConfigs)
 	activePeriodicConfig := i.periodicConfigs[activePeriodicConfigIndex]
 	if activePeriodicConfig.IndexType != config.BoltDBShipperType {
@@ -672,7 +675,7 @@ func (i *Ingester) GetChunkIDs(ctx context.Context, req *logproto.GetChunkIDsReq
 	}
 
 	boltdbShipperMaxLookBack := i.boltdbShipperMaxLookBack()
-	if boltdbShipperMaxLookBack == 0 {
+	if boltdbShipperMaxLookBack <= 0 {
 		return &logproto.GetChunkIDsResponse{}, nil
 	}
 
@@ -680,7 +683,7 @@ func (i *Ingester) GetChunkIDs(ctx context.Context, req *logproto.GetChunkIDsReq
 	reqStart = adjustQueryStartTime(boltdbShipperMaxLookBack, reqStart, time.Now())
 
 	// parse the request
-	start, end := errUtil.RoundToMilliseconds(reqStart, req.End)
+	start, end := util.RoundToMilliseconds(reqStart, req.End)
 	matchers, err := syntax.ParseMatchers(req.Matchers)
 	if err != nil {
 		return nil, err
@@ -762,7 +765,7 @@ func (i *Ingester) Label(ctx context.Context, req *logproto.LabelRequest) (*logp
 	}
 
 	return &logproto.LabelResponse{
-		Values: errUtil.MergeStringLists(resp.Values, storeValues),
+		Values: util.MergeStringLists(resp.Values, storeValues),
 	}, nil
 }
 
@@ -778,8 +781,17 @@ func (i *Ingester) Series(ctx context.Context, req *logproto.SeriesRequest) (*lo
 }
 
 // Check implements grpc_health_v1.HealthCheck.
-func (*Ingester) Check(ctx context.Context, req *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
-	return &grpc_health_v1.HealthCheckResponse{Status: grpc_health_v1.HealthCheckResponse_SERVING}, nil
+func (i *Ingester) Check(ctx context.Context, req *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
+	status := grpc_health_v1.HealthCheckResponse_SERVING
+	// service state must be RUNNING
+	if state := i.State(); state != services.Running {
+		status = grpc_health_v1.HealthCheckResponse_NOT_SERVING
+	}
+	// lifecycler state must be ACTIVE
+	if state := i.lifecycler.GetState(); state != ring.ACTIVE {
+		status = grpc_health_v1.HealthCheckResponse_NOT_SERVING
+	}
+	return &grpc_health_v1.HealthCheckResponse{Status: status}, nil
 }
 
 // Watch implements grpc_health_v1.HealthCheck.
