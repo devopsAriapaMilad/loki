@@ -649,6 +649,9 @@ func (i *Ingester) QuerySample(req *logproto.SampleQueryRequest, queryServer log
 // max look back is limited to from time of boltdb-shipper config.
 // It considers previous periodic config's from time if that also has index type set to boltdb-shipper.
 func (i *Ingester) boltdbShipperMaxLookBack() time.Duration {
+	if len(i.periodicConfigs) == 0 {
+		return -1 << 63
+	}
 	activePeriodicConfigIndex := config.ActivePeriodConfig(i.periodicConfigs)
 	activePeriodicConfig := i.periodicConfigs[activePeriodicConfigIndex]
 	if activePeriodicConfig.IndexType != config.BoltDBShipperType {
@@ -672,7 +675,7 @@ func (i *Ingester) GetChunkIDs(ctx context.Context, req *logproto.GetChunkIDsReq
 	}
 
 	boltdbShipperMaxLookBack := i.boltdbShipperMaxLookBack()
-	if boltdbShipperMaxLookBack == 0 {
+	if boltdbShipperMaxLookBack <= 0 {
 		return &logproto.GetChunkIDsResponse{}, nil
 	}
 
@@ -778,8 +781,17 @@ func (i *Ingester) Series(ctx context.Context, req *logproto.SeriesRequest) (*lo
 }
 
 // Check implements grpc_health_v1.HealthCheck.
-func (*Ingester) Check(ctx context.Context, req *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
-	return &grpc_health_v1.HealthCheckResponse{Status: grpc_health_v1.HealthCheckResponse_SERVING}, nil
+func (i *Ingester) Check(ctx context.Context, req *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
+	status := grpc_health_v1.HealthCheckResponse_SERVING
+	// service state must be RUNNING
+	if state := i.State(); state != services.Running {
+		status = grpc_health_v1.HealthCheckResponse_NOT_SERVING
+	}
+	// lifecycler state must be ACTIVE
+	if state := i.lifecycler.GetState(); state != ring.ACTIVE {
+		status = grpc_health_v1.HealthCheckResponse_NOT_SERVING
+	}
+	return &grpc_health_v1.HealthCheckResponse{Status: status}, nil
 }
 
 // Watch implements grpc_health_v1.HealthCheck.

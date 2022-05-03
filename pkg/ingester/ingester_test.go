@@ -3,6 +3,8 @@ package ingester
 import (
 	"fmt"
 	"log"
+	"math"
+	"math/rand"
 	"net"
 	"net/http"
 	"sort"
@@ -10,13 +12,18 @@ import (
 	"testing"
 	"time"
 
+	gokitlog "github.com/go-kit/log"
 	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/kv"
+	"github.com/grafana/dskit/kv/consul"
+	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/services"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/middleware"
+	"github.com/weaveworks/common/server"
 	"github.com/weaveworks/common/user"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
@@ -32,10 +39,13 @@ import (
 	"github.com/grafana/loki/pkg/iter"
 	"github.com/grafana/loki/pkg/logproto"
 	"github.com/grafana/loki/pkg/logql"
+	"github.com/grafana/loki/pkg/querier"
 	"github.com/grafana/loki/pkg/runtime"
 	"github.com/grafana/loki/pkg/storage/chunk"
 	"github.com/grafana/loki/pkg/storage/chunk/fetcher"
 	"github.com/grafana/loki/pkg/storage/config"
+	loki_net "github.com/grafana/loki/pkg/util/net"
+	"github.com/grafana/loki/pkg/util/test"
 	"github.com/grafana/loki/pkg/validation"
 )
 
@@ -481,6 +491,101 @@ func TestIngester_boltdbShipperMaxLookBack(t *testing.T) {
 			require.InDelta(t, tc.expectedMaxLookBack, mlb, float64(time.Second))
 		})
 	}
+}
+
+func ingesterConfig(kvStore kv.Client, instanceID string, port int) Config {
+	iface, _ := loki_net.LoopbackInterfaceName()
+	cfg := Config{}
+	flagext.DefaultValues(&cfg)
+	cfg.FlushCheckPeriod = 99999 * time.Hour
+	cfg.MaxChunkIdle = 99999 * time.Hour
+	cfg.ConcurrentFlushes = 1
+	cfg.LifecyclerConfig.RingConfig.KVStore.Mock = kvStore
+	cfg.LifecyclerConfig.InfNames = []string{iface}
+	cfg.LifecyclerConfig.ID = instanceID
+	cfg.LifecyclerConfig.ListenPort = port
+	cfg.LifecyclerConfig.Port = 0
+	cfg.LifecyclerConfig.FinalSleep = 10 * time.Millisecond
+	cfg.LifecyclerConfig.MinReadyDuration = 0
+	cfg.BlockSize = 256 * 1024
+	cfg.TargetChunkSize = 1500 * 1024
+	cfg.WAL.Enabled = false
+	return cfg
+}
+
+func TestIngester_QueryDuringShutdown(t *testing.T) {
+	logger := gokitlog.NewNopLogger()
+	kvStore, closer := consul.NewInMemoryClient(ring.GetCodec(), logger, nil)
+	defer closer.Close()
+
+	limits, err := validation.NewOverrides(defaultLimitsTestConfig(), nil)
+	require.NoError(t, err)
+
+	store := &mockStore{chunks: map[string][]chunk.Chunk{}}
+
+	numIngesters := 1
+	ingesters := make([]*Ingester, numIngesters)
+	ingestersByAddr := map[string]ring.InstanceDesc{}
+
+	ingesterClientConfig := client.Config{}
+	flagext.DefaultValues(&ingesterClientConfig)
+	// TODO: remove timeout, just needed for debugging
+	ingesterClientConfig.RemoteTimeout = 1 * time.Hour
+
+	ingesterRing, err := ring.New(ring.Config{
+		KVStore:           kv.Config{Mock: kvStore},
+		HeartbeatTimeout:  60 * time.Minute,
+		ReplicationFactor: 1,
+	}, RingKey, RingKey, logger, nil)
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), ingesterRing))
+
+	for i := 0; i < numIngesters; i++ {
+		port := 63000 + rand.Intn(1000)
+
+		serverConfig := server.Config{}
+		flagext.DefaultValues(&serverConfig)
+		serverConfig.HTTPListenPort = 0
+		serverConfig.GRPCListenPort = port
+
+		s, _ := server.New(serverConfig)
+
+		cfg := ingesterConfig(kvStore, fmt.Sprintf("ingester-%d", i), port)
+		ingester, err := New(cfg, ingesterClientConfig, store, limits, runtime.DefaultTenantConfigs(), nil)
+		require.NoError(t, err)
+		logproto.RegisterQuerierServer(s.GRPC, ingester)
+		go s.Run()
+		defer s.Stop()
+
+		require.Nil(t, services.StartAndAwaitRunning(context.Background(), ingester))
+		ingesters[i] = ingester
+
+		addr := ingester.lifecycler.Addr
+		ingestersByAddr[addr] = ring.InstanceDesc{
+			Addr:                addr,
+			State:               ring.ACTIVE,
+			Timestamp:           time.Now().Unix(),
+			RegisteredTimestamp: time.Now().Add(-10 * time.Minute).Unix(),
+			Tokens:              []uint32{uint32((math.MaxUint32 / numIngesters) * i)},
+		}
+	}
+
+	test.Poll(t, time.Second, numIngesters, func() interface{} {
+		return ingesterRing.InstancesCount()
+	})
+
+	ingesterQuerier, err := querier.NewIngesterQuerier(ingesterClientConfig, ingesterRing, 0)
+	require.NoError(t, err)
+
+	// for _, ingester := range ingesters {
+	// 	go services.StopAndAwaitTerminated(context.Background(), ingester) //nolint:errcheck
+	// }
+
+	ctx := user.InjectOrgID(context.Background(), "fake")
+	res, err := ingesterQuerier.GetChunkIDs(ctx, model.Now().Add(-1*time.Hour), model.Now())
+
+	require.NoError(t, err)
+	require.Equal(t, res, []string{})
 }
 
 func TestValidate(t *testing.T) {
@@ -985,4 +1090,69 @@ func jsonLine(ts int64, i int) string {
 		return fmt.Sprintf(`{"a":"b", "c":"d", "e":"f", "g":"h", "ts":"%d"}`, ts)
 	}
 	return fmt.Sprintf(`{"e":"f", "h":"i", "j":"k", "g":"h", "ts":"%d"}`, ts)
+}
+
+type mockRing struct {
+	ingesters         []ring.InstanceDesc
+	replicationFactor uint32
+}
+
+func (r mockRing) Get(key uint32, op ring.Operation, buf []ring.InstanceDesc, _ []string, _ []string) (ring.ReplicationSet, error) {
+	result := ring.ReplicationSet{
+		MaxErrors: 1,
+		Instances: buf[:0],
+	}
+	for i := uint32(0); i < r.replicationFactor; i++ {
+		n := (key + i) % uint32(len(r.ingesters))
+		result.Instances = append(result.Instances, r.ingesters[n])
+	}
+	return result, nil
+}
+
+func (r mockRing) GetAllHealthy(op ring.Operation) (ring.ReplicationSet, error) {
+	return r.GetReplicationSetForOperation(op)
+}
+
+func (r mockRing) GetReplicationSetForOperation(op ring.Operation) (ring.ReplicationSet, error) {
+	return ring.ReplicationSet{
+		Instances: r.ingesters,
+		MaxErrors: 1,
+	}, nil
+}
+
+func (r mockRing) ReplicationFactor() int {
+	return int(r.replicationFactor)
+}
+
+func (r mockRing) InstancesCount() int {
+	return len(r.ingesters)
+}
+
+func (r mockRing) Subring(key uint32, n int) ring.ReadRing {
+	return r
+}
+
+func (r mockRing) HasInstance(instanceID string) bool {
+	for _, ing := range r.ingesters {
+		if ing.Addr != instanceID {
+			return true
+		}
+	}
+	return false
+}
+
+func (r mockRing) ShuffleShard(identifier string, size int) ring.ReadRing {
+	// take advantage of pass by value to bound to size:
+	r.ingesters = r.ingesters[:size]
+	return r
+}
+
+func (r mockRing) ShuffleShardWithLookback(identifier string, size int, lookbackPeriod time.Duration, now time.Time) ring.ReadRing {
+	return r
+}
+
+func (r mockRing) CleanupShuffleShardCache(identifier string) {}
+
+func (r mockRing) GetInstanceState(instanceID string) (ring.InstanceState, error) {
+	return 0, nil
 }
